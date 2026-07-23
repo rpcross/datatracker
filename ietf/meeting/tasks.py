@@ -19,7 +19,7 @@ from .utils import (
     store_blobs_for_one_meeting,
 )
 from .views import generate_agenda_data
-from .utils import fetch_attendance_from_meetings
+from .utils import fetch_attendance_from_meetings, fix_missing_registrations
 
 
 @shared_task
@@ -246,3 +246,9 @@ def store_meeting_materials_as_blobs_task(
             log.log(
                 f"Blobs created in {(timezone.now() - mark).total_seconds():0.3f} seconds."
             )
+
+
+@shared_task
+def fix_missing_registrations_task():
+    """One time task to fix missing meeting.Registrations"""
+    fix_missing_registrations()

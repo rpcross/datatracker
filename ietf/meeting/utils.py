@@ -1852,5 +1852,100 @@ def process_single_registration(reg_data, meeting):
     return registration, action_taken
 
 
+def fix_missing_registrations(meeting=None):
+    """Recreate legacy registrations dropped by the meeting.Registration migration.
+
+    For meetings before 100 the legacy stats.MeetingRegistration system allowed
+    several registrations under one email with different names. The migration to
+    meeting.Registration keyed on (meeting, email) and kept only one, so the
+    extra legacy records - which are genuine registrations - were lost. This adds
+    a Registration for any legacy (meeting, email, name) with no matching row.
+
+    The migration also piled the extra legacy rows' tickets onto that single
+    surviving Registration instead of splitting them across records. For each
+    such duplicate email this trims the surviving record back to a single ticket
+    (the recreated registrations get their own tickets above).
+
+    If meeting (a meeting number) is given, only that meeting is checked;
+    otherwise all of meetings 72 through 99 are checked.
+
+    Returns (created, removed): the number of Registration records created and
+    the number of surplus tickets removed.
+    """
+    # import here to avoid a circular import with ietf.stats.models
+    from ietf.stats.models import MeetingRegistration
+
+    def norm(value):
+        return (value or "").strip().lower()
+
+    numbers = [int(meeting)] if meeting is not None else list(range(72, 100))
+    meeting_ids = [
+        m.pk
+        for m in Meeting.objects.filter(type="ietf")
+        if m.number.isdigit() and int(m.number) in numbers
+    ]
+
+    # names already present in the new table, keyed by (meeting, email)
+    existing = defaultdict(set)
+    for meeting_id, email, first, last in Registration.objects.filter(
+        meeting_id__in=meeting_ids
+    ).values_list("meeting_id", "email", "first_name", "last_name"):
+        existing[(meeting_id, norm(email))].add((norm(first), norm(last)))
+
+    # Registrations created during this run, keyed by (meeting, email, name), so
+    # repeated legacy rows for one attendee add tickets instead of duplicates.
+    added = {}
+    created = 0
+    collision_keys = set()  # (meeting, email) that had duplicate-email records
+    for mr in MeetingRegistration.objects.filter(meeting_id__in=meeting_ids):
+        key = (mr.meeting_id, norm(mr.email))
+        name = (norm(mr.first_name), norm(mr.last_name))
+        if name in existing[key]:
+            continue
+        collision_keys.add(key)
+        reg = added.get(key + name)
+        if reg is None:
+            reg = added[key + name] = Registration.objects.create(
+                meeting=mr.meeting,
+                first_name=mr.first_name,
+                last_name=mr.last_name,
+                affiliation=mr.affiliation,
+                country_code=mr.country_code,
+                person=mr.person,
+                email=mr.email,
+                attended=mr.attended,
+                checkedin=mr.checkedin,
+            )
+            created += 1
+            log("fix_missing_registrations created registration: email={!r} name={!r} {!r}".format(
+                mr.email, mr.first_name, mr.last_name))
+        reg.tickets.create(
+            attendance_type_id=mr.reg_type or 'unknown',
+            ticket_type_id=mr.ticket_type or 'unknown',
+        )
+
+    # Trim the tickets the migration piled onto the surviving record for each
+    # duplicate email, leaving a single ticket. The records created above are
+    # excluded - only the pre-existing (migrated) records are trimmed.
+    created_ids = {reg.pk for reg in added.values()}
+    surviving = defaultdict(list)
+    for reg in Registration.objects.filter(meeting_id__in=meeting_ids).exclude(
+        pk__in=created_ids
+    ):
+        surviving[(reg.meeting_id, norm(reg.email))].append(reg)
+
+    removed = 0
+    for key in collision_keys:
+        for reg in surviving.get(key, []):
+            extra = list(reg.tickets.order_by("id")[1:])
+            for ticket in extra:
+                log("fix_missing_registrations removed ticket {!r} from email={!r} name={!r} {!r}".format(
+                    str(ticket), reg.email, reg.first_name, reg.last_name))
+                ticket.delete()
+                removed += 1
+
+    return created, removed
+
+
 def fetch_attendance_from_meetings(meetings):
     return [sync_registration_data(meeting) for meeting in meetings]
